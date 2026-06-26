@@ -1,7 +1,6 @@
 package aws
 
 import (
-	"math"
 	"testing"
 
 	"scraper/aws/awsutils"
@@ -134,10 +133,6 @@ func assembleOnDemand(
 		licenseRates,
 	)
 	return getPricing(attributes["engineCode"]).OnDemand
-}
-
-func approxEqual(a, b float64) bool {
-	return math.Abs(a-b) < 1e-9
 }
 
 // TestUnbundledSqlServerLicense replicates the #890 scenario: a db.m7i.2xlarge SQL
