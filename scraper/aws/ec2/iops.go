@@ -7,12 +7,15 @@ import (
 	"scraper/utils"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/html"
 )
 
-// AWS publishes per-family instance-type docs as markdown. Each doc contains an
-// "Instance store specifications" table with a "Random read IOPS / Random write
-// IOPS" column keyed by instance type. We scrape those tables to expose the
-// instance-store random read/write IOPS on each instance.
+// AWS publishes per-family instance-type docs whose body is markdown but whose
+// "Instance store specifications" table is embedded as an HTML <table>. Each such
+// table has a "100% random read IOPS / Write IOPS" column keyed by instance type.
+// We scrape those tables to expose the instance-store random read/write IOPS on
+// each instance.
 const awsInstanceTypeDocBase = "https://docs.aws.amazon.com/ec2/latest/instancetypes"
 
 // iopsDocSlugs are the instance-type doc families that carry instance-store
@@ -24,27 +27,13 @@ var (
 	instanceHeaderRe = regexp.MustCompile(`(?i)instance type`)
 	// instanceTypeRe matches a "." followed by a word char, the same heuristic
 	// the original Node scraper used to tell instance-type rows (e.g. "m5.large")
-	// apart from family-header rows.
+	// apart from family-header rows (e.g. a "D2" colspan row).
 	instanceTypeRe = regexp.MustCompile(`\.\w`)
 )
 
 type storageIops struct {
 	readIops  int
 	writeIops int
-}
-
-// splitMarkdownRow splits a markdown table row into trimmed cells, dropping the
-// empty leading/trailing edges produced by the surrounding pipes.
-func splitMarkdownRow(line string) []string {
-	line = strings.TrimSpace(line)
-	line = strings.TrimPrefix(line, "|")
-	line = strings.TrimSuffix(line, "|")
-	parts := strings.Split(line, "|")
-	cells := make([]string, len(parts))
-	for i, p := range parts {
-		cells[i] = strings.TrimSpace(p)
-	}
-	return cells
 }
 
 // parseIopsValue mimics JS parseInt after stripping thousands separators: it
@@ -70,118 +59,127 @@ func parseIopsValue(s string) (int, bool) {
 	return n, true
 }
 
-// parseIopsTable parses the instance-store IOPS table out of one AWS
-// instance-type markdown doc, returning a lowercase-instance-type -> IOPS map.
-// It locates the table by its "Random read IOPS" header, then reads each data
-// row, skipping the separator row and family-header rows.
-func parseIopsTable(markdown string) map[string]storageIops {
-	lines := strings.Split(markdown, "\n")
-	inTable := false
-	iopsColIdx := -1
-	instanceColIdx := -1
-	results := map[string]storageIops{}
+// findNodes returns every descendant element of n with the given tag name.
+func findNodes(n *html.Node, tag string) []*html.Node {
+	var out []*html.Node
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode && node.Data == tag {
+			out = append(out, node)
+		}
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
 
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "|") {
-			// A non-table line ends the table once we are inside one.
-			if inTable {
-				break
-			}
+// nodeText returns the concatenated, trimmed text content of a node.
+func nodeText(n *html.Node) string {
+	var sb strings.Builder
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.TextNode {
+			sb.WriteString(node.Data)
+		}
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(sb.String())
+}
+
+// rowCells returns the trimmed text of a row's direct <td>/<th> cells, and
+// whether the row is a header row (contains any <th>).
+func rowCells(tr *html.Node) (cells []string, isHeader bool) {
+	for c := tr.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type != html.ElementNode || (c.Data != "td" && c.Data != "th") {
 			continue
 		}
+		cells = append(cells, nodeText(c))
+		if c.Data == "th" {
+			isHeader = true
+		}
+	}
+	return cells, isHeader
+}
 
-		cells := splitMarkdownRow(trimmed)
+// parseIopsTable parses the instance-store IOPS table out of one AWS
+// instance-type doc, returning a lowercase-instance-type -> IOPS map. It scans
+// every HTML <table>, locates the one whose header row carries the "random read
+// IOPS" column, then reads each data row, skipping family-header rows and rows
+// without IOPS data.
+func parseIopsTable(content string) map[string]storageIops {
+	results := map[string]storageIops{}
 
-		if !inTable {
-			for i, c := range cells {
-				if iopsHeaderRe.MatchString(c) {
-					iopsColIdx = i
-					break
+	doc, err := html.Parse(strings.NewReader(content))
+	if err != nil {
+		return results
+	}
+
+	for _, table := range findNodes(doc, "table") {
+		iopsColIdx, instanceColIdx := -1, -1
+
+		for _, row := range findNodes(table, "tr") {
+			cells, isHeader := rowCells(row)
+
+			if isHeader {
+				// Re-locate the columns from this header. A table without a
+				// "random read IOPS" header leaves iopsColIdx at -1, so its data
+				// rows are skipped below.
+				iopsColIdx, instanceColIdx = -1, -1
+				for i, c := range cells {
+					if iopsColIdx == -1 && iopsHeaderRe.MatchString(c) {
+						iopsColIdx = i
+					}
+					if instanceColIdx == -1 && instanceHeaderRe.MatchString(c) {
+						instanceColIdx = i
+					}
 				}
+				if instanceColIdx == -1 {
+					instanceColIdx = 0
+				}
+				continue
 			}
+
 			if iopsColIdx == -1 {
 				continue
 			}
-			inTable = true
-			instanceColIdx = 0
-			for i, c := range cells {
-				if instanceHeaderRe.MatchString(c) {
-					instanceColIdx = i
-					break
-				}
-			}
-			continue
-		}
-
-		// Skip the header/body separator row (cells of only dashes).
-		if isSeparatorRow(cells) {
-			continue
-		}
-
-		// Skip family-header rows: a single non-empty cell that is not itself an
-		// instance type.
-		nonEmpty := make([]string, 0, len(cells))
-		for _, c := range cells {
-			if c != "" {
-				nonEmpty = append(nonEmpty, c)
-			}
-		}
-		if len(nonEmpty) <= 1 {
-			first := ""
-			if len(nonEmpty) == 1 {
-				first = nonEmpty[0]
-			}
-			if !instanceTypeRe.MatchString(first) {
+			if instanceColIdx >= len(cells) || iopsColIdx >= len(cells) {
 				continue
 			}
-		}
 
-		if instanceColIdx >= len(cells) || iopsColIdx >= len(cells) {
-			continue
-		}
-		instanceType := cells[instanceColIdx]
-		if instanceType == "" || !instanceTypeRe.MatchString(instanceType) {
-			continue
-		}
+			// Skip family-header rows (e.g. a single "D2" colspan cell) and any
+			// non-instance-type row.
+			instanceType := cells[instanceColIdx]
+			if instanceType == "" || !instanceTypeRe.MatchString(instanceType) {
+				continue
+			}
 
-		iopsCell := strings.TrimSpace(cells[iopsColIdx])
-		if iopsCell == "" {
-			continue
-		}
-		parts := strings.Split(iopsCell, "/")
-		if len(parts) != 2 {
-			continue
-		}
-		readIops, okRead := parseIopsValue(parts[0])
-		writeIops, okWrite := parseIopsValue(parts[1])
-		if !okRead || !okWrite {
-			continue
-		}
+			iopsCell := cells[iopsColIdx]
+			if iopsCell == "" {
+				continue
+			}
+			parts := strings.Split(iopsCell, "/")
+			if len(parts) != 2 {
+				continue
+			}
+			readIops, okRead := parseIopsValue(parts[0])
+			writeIops, okWrite := parseIopsValue(parts[1])
+			if !okRead || !okWrite {
+				continue
+			}
 
-		results[strings.ToLower(instanceType)] = storageIops{
-			readIops:  readIops,
-			writeIops: writeIops,
+			results[strings.ToLower(instanceType)] = storageIops{
+				readIops:  readIops,
+				writeIops: writeIops,
+			}
 		}
 	}
 
 	return results
-}
-
-// isSeparatorRow reports whether every cell consists solely of dashes (the
-// markdown header/body separator), e.g. "--- | ---".
-func isSeparatorRow(cells []string) bool {
-	for _, c := range cells {
-		if c == "" {
-			return false
-		}
-		for _, r := range c {
-			if r != '-' {
-				return false
-			}
-		}
-	}
-	return len(cells) > 0
 }
 
 // addStorageIopsInfo fetches the AWS instance-type docs, parses the

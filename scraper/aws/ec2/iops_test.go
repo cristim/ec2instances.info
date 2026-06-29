@@ -2,21 +2,38 @@ package ec2
 
 import "testing"
 
-// sampleIopsDoc mirrors the shape of the AWS instance-type markdown docs: some
-// prose, then an "Instance store specifications" table whose IOPS column is
-// "Random read IOPS / Random write IOPS", interspersed with a family-header row
-// and a row without IOPS data.
+// sampleIopsDoc mirrors the real AWS instance-type docs: a markdown body with an
+// "Instance store specifications" table embedded as HTML whose IOPS column is
+// "100% random read IOPS / Write IOPS". It includes a family-header colspan row,
+// an HDD row with an empty IOPS cell, and a leading unrelated table (which has no
+// IOPS column and must be ignored).
 const sampleIopsDoc = `# Storage instances
 
 Some intro text that should be ignored.
 
-| Instance size | Instance store volumes | Random read IOPS / Random write IOPS |
-| --- | --- | --- |
-| Compute optimized | | |
-| c7gd.medium | 1 x 59 GB NVMe SSD | 16,250 / 13,750 |
-| c7gd.large | 1 x 118 GB NVMe SSD | 33,542 / 27,917 |
-| m7gd.large | 1 x 118 GB NVMe SSD | 33,542 IOPS / 27,917 IOPS |
-| no-iops.large | 1 x 100 GB NVMe SSD | |
+<table>
+<thead>
+  <tr><th>Instance type</th><th>vCPUs</th></tr>
+</thead>
+<tbody>
+  <tr><td>c7gd.medium</td><td>1</td></tr>
+</tbody>
+</table>
+
+More prose.
+
+<table>
+<thead>
+  <tr><th>Instance type</th><th>Instance store volumes</th><th>Instance store type</th><th>100% random read IOPS / Write IOPS</th><th>TRIM support</th></tr>
+</thead>
+<tbody>
+  <tr><td colspan="5">C7gd</td></tr>
+  <tr><td>c7gd.medium</td><td>1 x 59 GB</td><td>NVMe SSD</td><td>16,250 / 13,750</td><td>&#10003; Yes</td></tr>
+  <tr><td>c7gd.large</td><td>1 x 118 GB</td><td>NVMe SSD</td><td>33,542 / 27,917</td><td>&#10003; Yes</td></tr>
+  <tr><td colspan="5">D2</td></tr>
+  <tr><td>d2.xlarge</td><td>3 x 2048 GB</td><td>HDD</td><td></td><td> </td></tr>
+</tbody>
+</table>
 
 Trailing prose ends the table.
 `
@@ -27,7 +44,6 @@ func TestParseIopsTable(t *testing.T) {
 	want := map[string]storageIops{
 		"c7gd.medium": {readIops: 16250, writeIops: 13750},
 		"c7gd.large":  {readIops: 33542, writeIops: 27917},
-		"m7gd.large":  {readIops: 33542, writeIops: 27917},
 	}
 
 	if len(got) != len(want) {
@@ -44,9 +60,9 @@ func TestParseIopsTable(t *testing.T) {
 		}
 	}
 
-	// Family-header rows, separator rows, and rows without IOPS data must be
-	// skipped rather than producing fabricated entries.
-	for _, skipped := range []string{"compute optimized", "no-iops.large"} {
+	// Family-header colspan rows and HDD rows without IOPS data must be skipped
+	// rather than producing fabricated entries.
+	for _, skipped := range []string{"c7gd", "d2.xlarge"} {
 		if _, ok := got[skipped]; ok {
 			t.Errorf("expected %q to be skipped, but it was parsed", skipped)
 		}
